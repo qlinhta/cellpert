@@ -4,11 +4,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.model_selection import train_test_split
-import mlflow
-import mlflow.pytorch
-
-# Initialize MLflow run
-mlflow.start_run()
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 # Load and preprocess the data
 df = pd.read_csv("enriched/de_train_enriched.csv")
@@ -42,18 +39,18 @@ X_val, y_val = X[indices_val], y[indices_val]
 X_test, y_test = X[indices_test], y[indices_test]
 
 # Convert to PyTorch tensors
-X_train, y_train = torch.tensor(X_train), torch.tensor(y_train)
-X_val, y_val = torch.tensor(X_val), torch.tensor(y_val)
-X_test, y_test = torch.tensor(X_test), torch.tensor(y_test)
+X_train, y_train = torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.float32)
+X_val, y_val = torch.tensor(X_val, dtype=torch.float32), torch.tensor(y_val, dtype=torch.float32)
+X_test, y_test = torch.tensor(X_test, dtype=torch.float32), torch.tensor(y_test, dtype=torch.float32)
 
 
 # Base Learner
 class BaseLearner(nn.Module):
     def __init__(self):
         super(BaseLearner, self).__init__()
-        self.fc1 = nn.Linear(27, 256)
+        self.fc1 = nn.Linear(27, 256)  # Assuming the input features are 27, adjust if different
         self.fc2 = nn.Linear(256, 512)
-        self.fc3 = nn.Linear(512, 18211)
+        self.fc3 = nn.Linear(512, 1)  # Assuming single target regression, adjust if different
 
     def forward(self, x):
         x = torch.relu(self.fc1(x))
@@ -66,8 +63,8 @@ class BaseLearner(nn.Module):
 class MetaLearner(nn.Module):
     def __init__(self):
         super(MetaLearner, self).__init__()
-        self.fc1 = nn.Linear(512 + 1, 256)
-        self.fc2 = nn.Linear(256, 18211)
+        self.fc1 = nn.Linear(512 + 1, 256)  # Concatenation of base output and cell type
+        self.fc2 = nn.Linear(256, 1)  # Assuming single target regression, adjust if different
 
     def forward(self, x):
         x = torch.relu(self.fc1(x))
@@ -75,40 +72,53 @@ class MetaLearner(nn.Module):
         return x
 
 
-# Instantiate models
-base_learner = BaseLearner()
-meta_learner = MetaLearner()
+# Instantiate models and move them to the appropriate device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+base_learner = BaseLearner().to(device)
+meta_learner = MetaLearner().to(device)
 
 # Loss and Optimizer
 criterion = nn.MSELoss()
 optimizer = optim.Adam(list(base_learner.parameters()) + list(meta_learner.parameters()), lr=0.001)
 
-# Training Loop
-for epoch in range(100):
-    # Forward pass through base learner
-    base_output = base_learner(X_train)
-    cell_type = cell_types[indices_train]  # Extract cell types for training data
-    cell_type = torch.tensor(cell_type).unsqueeze(1)  # Convert to tensor and add dimension
+# Initialize TensorBoard SummaryWriter
+writer = SummaryWriter()
 
-    # Concatenate base learner output with cell type
-    meta_input = torch.cat((base_output, cell_type), dim=1)
+# Training Loop with tqdm progress bar
+for epoch in tqdm(range(100), desc="Training Epochs"):
+    # Transfer data to device
+    X_train = X_train.to(device)
+    y_train = y_train.to(device)
 
-    # Forward pass through meta learner
-    meta_output = meta_learner(meta_input)
-
-    # Compute loss and backpropagate
-    loss = criterion(meta_output, y_train)
-    loss.backward()
-    optimizer.step()
+    # Zero the parameter gradients
     optimizer.zero_grad()
 
-    # Log metrics to MLflow
-    mlflow.log_metric("epoch", epoch)
-    mlflow.log_metric("loss", loss.item())
+    # Forward pass through base learner
+    base_learner_output = base_learner(X_train)
 
-# Save models to MLflow
-mlflow.pytorch.log_model(base_learner, "base_learner")
-mlflow.pytorch.log_model(meta_learner, "meta_learner")
+    # Concatenate base learner output with cell type
+    cell_type = torch.tensor([1 if ct in ['T', 'NK'] else 0 for ct in cell_types[indices_train]],
+                             dtype=torch.float32).to(device)
+    meta_learner_input = torch.cat((base_learner_output, cell_type.unsqueeze(1)), dim=1)
 
-# End MLflow run
-mlflow.end_run()
+    # Forward pass through meta learner
+    meta_learner_output = meta_learner(meta_learner_input)
+
+    # Calculate loss
+    loss = criterion(meta_learner_output, y_train.unsqueeze(1))
+
+    # Backward pass
+    loss.backward()
+
+    # Update weights
+    optimizer.step()
+
+    # Log to TensorBoard
+    writer.add_scalar('Loss/train', loss.item(), epoch)
+
+# Save the models
+torch.save(base_learner.state_dict(), "base_learner.pth")
+torch.save(meta_learner.state_dict(), "meta_learner.pth")
+
+# Close the SummaryWriter
+writer.close()
